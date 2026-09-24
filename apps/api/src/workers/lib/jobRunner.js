@@ -7,6 +7,29 @@ const { log, hostname } = require('./logger');
  * present.
  */
 async function runJob(definition, scheduledFor) {
+  // Worker replicas each run the scheduler; a session advisory lock held for
+  // the whole run ensures only one of them executes a given job at a time.
+  const lockConnection = await db.client.acquireConnection();
+  try {
+    const { rows } = await lockConnection.query(
+      'SELECT pg_try_advisory_lock(hashtext($1)) AS locked',
+      [definition.name]
+    );
+    if (!rows[0].locked) {
+      log(null, 'info', `${definition.name} skipped — already running on another worker`, {});
+      return { ok: true };
+    }
+    try {
+      return await executeJob(definition, scheduledFor);
+    } finally {
+      await lockConnection.query('SELECT pg_advisory_unlock(hashtext($1))', [definition.name]);
+    }
+  } finally {
+    await db.client.releaseConnection(lockConnection);
+  }
+}
+
+async function executeJob(definition, scheduledFor) {
   const [job] = await db('jobs')
     .insert({
       name: definition.name,
